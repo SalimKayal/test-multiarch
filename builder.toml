@@ -1,0 +1,47 @@
+description = "Builder for cuda enabled python environments"
+
+[[buildpacks]]
+  id = "heroku/deb-packages"
+  uri = "docker://docker.io/heroku/buildpack-deb-packages@sha256:7d0a8f14d684436af11070a89e7b20a5e457166dfeed686cb915d46488684c1d"
+
+[[buildpacks]]
+  id = "heroku/python"
+  uri = "docker://docker.io/heroku/buildpack-python@sha256:e19a33063aa1856bda1febdb40a983faecd08a13f4f68c664b916591ba224bb2"
+
+[[buildpacks]]
+  id = "heroku/procfile"
+  uri = "docker://docker.io/heroku/buildpack-procfile@sha256:6ace71a217485b2932c8e4a311a502b68fde1a3c81e23576e29a9a1dba9a489a"
+
+
+[lifecycle]
+  version = "0.20.11"
+
+[[order]]
+  [[order.group]]
+    id = "heroku/deb-packages"
+    version = "0.1.3"
+    optional = true
+  [[order.group]]
+    id = "heroku/python"
+    version = "2.2.2"
+  [[order.group]]
+    id = "heroku/procfile"
+    version = "4.2.1"
+    optional = true
+
+[build]
+  image = "cuda-build-run:latest"
+[run]
+[[run.images]]
+  image = "cuda-build-run:latest"
+  mirrors = []
+
+
+# Target platforms - this triggers multi-arch builder creation
+[[targets]]
+os = "linux"
+arch = "amd64"
+
+[[targets]]
+os = "linux"
+arch = "arm64"

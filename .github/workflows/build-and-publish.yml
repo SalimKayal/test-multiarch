@@ -1,0 +1,268 @@
+name: Build and Push Application Image
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/my-cuda-app
+
+jobs:
+  create_local_images:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["amd64", "arm64"]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    steps:
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: true
+
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.12.0
+            network=host
+
+      - name: Install Pack CLI
+        uses: buildpacks/github-actions/setup-pack@v5.9.4
+
+      - name: Build CUDA Build Image (local only)
+        run: |
+          docker build -t cuda-build-run:latest -f Dockerfile \
+            --platform linux/${{ matrix.arch }} .
+
+      - name: Create Builder Image (local only)
+        run: |
+          pack builder create cuda-builder:latest \
+            --config builder.toml \
+            --pull-policy if-not-present
+
+      - name: Export Docker images from the Docker daemon
+        run: |
+          docker save cuda-builder:latest cuda-build-run:latest | \
+            zstd -T0 --long=31 -o images.tar.zst
+
+      - name: Save Docker images to the cache
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ github.run_id }}-cuda-images-${{ matrix.arch }}
+          path: images.tar.zst
+
+  build_application_image:
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    needs: create_local_images
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["amd64", "arm64"]
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: true
+
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Maximize Disk Space (Aggressive)
+        run: |
+          echo "Available space before cleanup:"
+          df -h
+          # Remove Java (JDKs)
+          sudo rm -rf /usr/lib/jvm
+
+          # Remove .NET SDKs
+          sudo rm -rf /usr/share/dotnet
+
+          # Remove Swift toolchain
+          sudo rm -rf /usr/share/swift
+
+          # Remove Haskell (GHC)
+          sudo rm -rf /usr/local/.ghcup
+
+          # Remove Julia
+          sudo rm -rf /usr/local/julia*
+
+          # Remove Android SDKs
+          sudo rm -rf /usr/local/lib/android
+
+          # Remove Chromium (optional if not using for browser tests)
+          sudo rm -rf /usr/local/share/chromium
+
+          # Remove Microsoft/Edge and Google Chrome builds
+          sudo rm -rf /opt/microsoft /opt/google
+
+          # Remove Azure CLI
+          sudo rm -rf /opt/az
+
+          # Remove PowerShell
+          sudo rm -rf /usr/local/share/powershell
+
+          # Remove CodeQL and other toolcaches
+          sudo rm -rf /opt/hostedtoolcache
+
+          docker system prune -af || true
+          docker builder prune -af || true
+       
+
+          echo "Available space after cleanup:"
+          df -h
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Pack CLI
+        uses: buildpacks/github-actions/setup-pack@v5.9.4
+
+      - name: Configure Docker for Large Images
+        run: |
+          sudo systemctl stop docker
+          echo '{"storage-driver": "overlay2", "max-concurrent-downloads": 1, "max-concurrent-uploads": 1, "log-driver": "none"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          docker system prune -af --volumes
+
+      - name: Restore Docker images from the cache
+        uses: actions/cache/restore@v4
+        with:
+          fail-on-cache-miss: true
+          key: ${{ github.run_id }}-cuda-images-${{ matrix.arch }}
+          path: images.tar.zst
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 1
+
+      - name: Load Docker images into the Docker daemon
+        run: |
+          zstd -dc --long=31 images.tar.zst | docker load
+          rm -rf images.tar.zst
+
+      - name: Build Application Image
+        run: |
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          pack build ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-${{ matrix.arch }} \
+            --builder cuda-builder:latest \
+            --trust-builder \
+            --pull-policy never \
+            --platform linux/${{ matrix.arch }}
+
+      - name: Export Application Image
+        run: |
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker save ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-${{ matrix.arch }} | \
+            zstd -T0 --long=31 -o app-image.tar.zst
+
+      - name: Save Application Image to cache
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ github.run_id }}-app-image-${{ matrix.arch }}
+          path: app-image.tar.zst
+
+  push_application_image:
+    runs-on: ubuntu-24.04
+    if: success() && github.ref == 'refs/heads/main'
+    needs: build_application_image
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["amd64", "arm64"]
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: true
+
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore Application Image from cache
+        uses: actions/cache/restore@v4
+        with:
+          fail-on-cache-miss: true
+          key: ${{ github.run_id }}-app-image-${{ matrix.arch }}
+          path: app-image.tar.zst
+
+      - name: Load and Push Application Image
+        run: |
+          zstd -dc --long=31 app-image.tar.zst | docker load
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker push ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-${{ matrix.arch }}
+
+  create_manifest:
+    runs-on: ubuntu-24.04
+    needs: push_application_image
+    if: success() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest lists
+        run: |
+          # Create manifest for commit SHA
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          docker manifest create ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }} \
+            ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-amd64 \
+            ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-arm64
+          docker manifest push ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}
+
+          # Create manifest for latest tag
+          docker manifest create ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:latest \
+            ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-amd64 \
+            ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:${{ github.sha }}_linux-arm64
+          docker manifest push ${{ env.REGISTRY }}/${IMAGE_NAME_LOWER}:latest
+
